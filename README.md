@@ -1,4 +1,4 @@
-# eat
+# Eat CLI
 
 Download Spotify tracks, albums, and playlists as tagged `.m4a` files.  
 Finds the best YouTube match, pulls lyrics, and writes full tags — one command.
