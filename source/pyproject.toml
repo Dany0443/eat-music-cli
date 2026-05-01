@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eatmusic"
+version = "1.0.2"
+requires-python = ">=3.10"
+dependencies = [
+    "yt-dlp>=2024.1",
+    "mutagen>=1.47",
+    "requests>=2.31",
+    "rapidfuzz>=3.6",
+    "rich>=13.7",
+    "click>=8.1",
+]
+
+[project.scripts]
+eat = "eatmusic.eat:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["eatmusic*"]
