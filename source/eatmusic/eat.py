@@ -93,33 +93,32 @@ def _is_newer_version(latest: str, current: str) -> bool:
     return a + (0,) * (n - len(a)) > b + (0,) * (n - len(b))
 
 def _maybe_print_update_notice(force: bool = False, show_when_latest: bool = False) -> None:
-    current = _current_version()
-    c = _read(_CACHE)
-    now = time.time()
-    latest = ""
-    checked = float(c.get("update_checked_at") or 0.0)
-    if not force and checked > 0 and now - checked < _UPDATE_INTERVAL_SEC:
-        latest = str(c.get("update_latest") or "").strip()
-    else:
-        try:
+    try:
+        current = _current_version()
+        c = _read(_CACHE)
+        now = time.time()
+        latest = ""
+        checked = float(c.get("update_checked_at") or 0.0)
+        if not force and checked > 0 and now - checked < _UPDATE_INTERVAL_SEC:
+            latest = str(c.get("update_latest") or "").strip()
+        else:
             r = requests.get(
                 _UPDATE_URL,
-                timeout=3.0,
+                timeout=1.8,
                 headers={"User-Agent": f"eatmusic/{current}"},
             )
             if r.status_code == 200:
-                raw = (r.text or "").strip().splitlines()[0]
-                latest = raw.split("#")[0].strip()
+                latest = (r.text or "").strip().splitlines()[0].strip()
             c["update_checked_at"] = now
             c["update_latest"] = latest
             _write(_CACHE, c)
-        except Exception:
-            return
-    if latest and _is_newer_version(latest, current):
-        C.print(f"[yellow]Update available: {current} → {latest}[/yellow]")
-        C.print(f"[dim]curl -fsSL {_REINSTALL_URL} | bash[/dim]")
-    elif show_when_latest:
-        C.print(f"[green]You are up to date ({current})[/green]")
+        if latest and _is_newer_version(latest, current):
+            C.print(f"[yellow]Update available: {current} -> {latest}[/yellow]")
+            C.print(f"[dim]Reinstall: curl -fsSL {_REINSTALL_URL} | bash[/dim]")
+        elif show_when_latest:
+            C.print(f"[green]You are up to date: {current}[/green]")
+    except Exception:
+        pass
 
 # ── Filesystem helpers ────────────────────────────────────────────────────────
 
@@ -224,12 +223,20 @@ def find_youtube(t: Track) -> Optional[str]:
 # ── Download ──────────────────────────────────────────────────────────────────
 
 def _cookies_from_browser_arg(val: str):
-    parts = [p.strip() for p in val.split(":", 1)]
+    parts = [p.strip() for p in val.split(":", 3)]
     if not parts[0]:
         return None
-    if len(parts) == 1:
-        return (parts[0], None, None, None)
-    return (parts[0], parts[1] or None, None, None)
+    parts = (parts + ["", "", ""])[:4]
+    return (parts[0], parts[1] or None, parts[2] or None, parts[3] or None)
+
+def _short_error(exc: Exception) -> str:
+    msg = str(exc).strip() or exc.__class__.__name__
+    msg = re.sub(r"\s+", " ", msg)
+    return msg[:260]
+
+def _is_forbidden_error(msg: str) -> bool:
+    msg_l = msg.lower()
+    return "403" in msg_l or "forbidden" in msg_l or "access denied" in msg_l
 
 def download(
     yt_url: str,
@@ -237,7 +244,7 @@ def download(
     yt_cookies: str = "",
     yt_cookies_from_browser: str = "",
     yt_sleep: float = 0.0,
-) -> bool:
+) -> tuple[bool, str]:
     """Download best audio and convert to .m4a."""
     import tempfile, shutil
     with tempfile.TemporaryDirectory(prefix="eatmusic_") as tmp:
@@ -247,38 +254,53 @@ def download(
             "outtmpl":   tmpl,
             "quiet":     True,
             "no_warnings": True,
-            "retries":   5,
-            "fragment_retries": 5,
-            "extractor_retries": 3,
+            "noplaylist": True,
+            "socket_timeout": 15,
+            "retries":   2,
+            "fragment_retries": 2,
+            "extractor_retries": 1,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["default", "ios"],
+                },
+            },
             "postprocessors": [{
                 "key":            "FFmpegExtractAudio",
                 "preferredcodec": "m4a",
                 "preferredquality": "0",
             }],
         }
-        if yt_cookies:
-            opts["cookiefile"] = yt_cookies
         if yt_cookies_from_browser:
             cb = _cookies_from_browser_arg(yt_cookies_from_browser)
             if cb:
                 opts["cookiesfrombrowser"] = cb
+        elif yt_cookies:
+            cookie_path = Path(_normalize_path_str(yt_cookies)).expanduser()
+            if not cookie_path.exists() or not cookie_path.is_file():
+                return False, f"cookie file not found: {cookie_path}"
+            opts["cookiefile"] = str(cookie_path)
         if yt_sleep > 0:
             opts["sleep_interval_requests"] = yt_sleep
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([yt_url])
-        except Exception:
-            return False
+        except Exception as e:
+            msg = _short_error(e)
+            if _is_forbidden_error(msg):
+                msg = f"YouTube returned 403/Forbidden; update yt-dlp and refresh YouTube cookies ({msg})"
+            return False, msg
 
         produced = next(
             (f for ext in ("m4a","aac","opus","webm","mp3","ogg")
              for f in Path(tmp).glob(f"*.{ext}")), None
         )
         if not produced:
-            return False
+            return False, "yt-dlp finished but produced no audio file"
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(produced), str(dest))
-    return dest.exists() and dest.stat().st_size > 10_000
+    if dest.exists() and dest.stat().st_size > 10_000:
+        return True, "downloaded"
+    return False, "downloaded file was missing or too small"
 
 # ── Tagging ───────────────────────────────────────────────────────────────────
 
@@ -404,12 +426,17 @@ def process(
 
     # Download with alternate candidates
     chosen = ""
+    dl_errors: list[str] = []
     for yt_url in yt_candidates:
-        if download(yt_url, dest, yt_cookies, yt_cookies_from_browser, yt_sleep):
+        ok, dl_msg = download(yt_url, dest, yt_cookies, yt_cookies_from_browser, yt_sleep)
+        if ok:
             chosen = yt_url
             break
+        dl_errors.append(dl_msg)
     if not chosen:
         cache_set(f"yt:{t.id}", "")   # invalidate bad cache entry
+        if dl_errors:
+            return False, "download failed: " + dl_errors[-1]
         return False, "download failed after candidate retries"
     cache_set(f"yt:{t.id}", chosen)
 

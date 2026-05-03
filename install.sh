@@ -69,6 +69,12 @@ die() {
     exit 1
 }
 
+fail_step() {
+    echo ""
+    echo -e "${RED}[ERROR]${NC} $*"
+    return 1
+}
+
 detect_os() {
     if [[ -f /etc/os-release ]]; then
         # shellcheck disable=SC1091
@@ -117,7 +123,7 @@ confirm_start() {
     if [[ "$AUTO_YES" -eq 1 ]]; then
         return
     fi
-    printf "${BOLD}Continue installation? [Y/n]: ${NC}"
+    printf "${BOLD}Continue installation? [Y/n]: ${NC}" > /dev/tty
     read -r ans < /dev/tty
     ans="${ans:-Y}"
     if [[ ! "$ans" =~ ^[Yy]$ ]]; then
@@ -127,14 +133,28 @@ confirm_start() {
 
 confirm_pkg_install() {
     local pkg="$1"
+    local why="${2:-}"
     if [[ "$AUTO_YES" -eq 1 ]]; then
         return 0
     fi
-    printf "${BOLD}Install dependency '${pkg}'? [Y/n]: ${NC}"
+    if [[ -n "$why" ]]; then
+        printf "\n${YELLOW}Missing dependency:${NC} %s (%s)\n" "$pkg" "$why" > /dev/tty
+    else
+        printf "\n${YELLOW}Missing dependency:${NC} %s\n" "$pkg" > /dev/tty
+    fi
+    printf "${BOLD}Install it now? [Y/n]: ${NC}" > /dev/tty
     local ans
     read -r ans < /dev/tty
     ans="${ans:-Y}"
     [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+add_pkg_if_missing() {
+    local cmd="$1" pkg="$2" why="$3"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        NEED_PKGS+=("$pkg")
+        NEED_WHY+=("$why")
+    fi
 }
 
 must_have_or_die() {
@@ -149,8 +169,17 @@ pkg_install() {
     if (( ${#pkgs[@]} == 0 )); then
         return
     fi
-    if [[ -z "$SUDO_CMD" && "$(id -u)" -ne 0 && "$PKG_MGR" != "brew" ]]; then
-        die "Need root privileges (sudo) to install packages: ${pkgs[*]}"
+    if [[ "$(id -u)" -ne 0 ]]; then
+        if [[ -z "$SUDO_CMD" ]]; then
+            fail_step "Need root privileges to install packages: ${pkgs[*]}"
+            print_manual_dependency_help "${pkgs[@]}"
+            return 1
+        fi
+        if ! ${SUDO_CMD} -v; then
+            fail_step "This user cannot install system packages with sudo."
+            print_manual_dependency_help "${pkgs[@]}"
+            return 1
+        fi
     fi
     case "$PKG_MGR" in
         apt)
@@ -170,9 +199,35 @@ pkg_install() {
             ${SUDO_CMD} zypper --non-interactive install "${pkgs[@]}"
             ;;
         *)
-            die "Unsupported package manager for auto install: $PKG_MGR"
+            fail_step "Unsupported package manager for auto install: $PKG_MGR"
+            return 1
             ;;
     esac
+}
+
+print_manual_dependency_help() {
+    local pkgs=("$@")
+    echo ""
+    echo -e "${YELLOW}[INFO]${NC} Ask an administrator to run:"
+    case "$PKG_MGR" in
+        apt)
+            echo "  sudo apt-get update && sudo apt-get install -y ${pkgs[*]}"
+            ;;
+        dnf)
+            echo "  sudo dnf install -y ${pkgs[*]}"
+            ;;
+        pacman)
+            echo "  sudo pacman -Sy --needed ${pkgs[*]}"
+            ;;
+        zypper)
+            echo "  sudo zypper install ${pkgs[*]}"
+            ;;
+        *)
+            echo "  Install these packages manually: ${pkgs[*]}"
+            ;;
+    esac
+    echo "Then rerun:"
+    echo "  curl -fsSL https://webjuniors.org/eatcli/install.sh | bash"
 }
 
 draw_progress() {
@@ -236,6 +291,31 @@ run_step() {
         die "Step failed: $label"
     fi
     draw_progress "$end_pct" "$label" " "
+    printf "\n"
+}
+
+run_interactive_step() {
+    local label="$1" fn="$2"
+    STEP_I=$((STEP_I + 1))
+    local start_pct=$(((STEP_I - 1) * 100 / TOTAL_STEPS))
+    local end_pct=$((STEP_I * 100 / TOTAL_STEPS))
+
+    : > "$LOG_FILE"
+    draw_progress "$start_pct" "$label" " "
+    printf "\n"
+
+    set +e
+    "$fn" 2>&1 | tee "$LOG_FILE"
+    local status=${PIPESTATUS[0]}
+    set -e
+
+    if [[ "$status" -ne 0 ]]; then
+        draw_progress "$start_pct" "$label" "!"
+        printf "\n"
+        die "Step failed: $label"
+    fi
+    draw_progress "$end_pct" "$label" " "
+    printf "\n"
 }
 
 step_clean() {
@@ -317,52 +397,70 @@ step_python() {
 }
 
 step_dependencies() {
-    local need=()
+    NEED_PKGS=()
+    NEED_WHY=()
     local mandatory=("python3" "pip3")
     local opt_ffmpeg=0
 
     case "$PKG_MGR" in
         apt)
-            command -v python3 >/dev/null 2>&1 || need+=("python3")
-            command -v pip3 >/dev/null 2>&1 || need+=("python3-pip")
-            command -v pipx >/dev/null 2>&1 || need+=("pipx")
+            add_pkg_if_missing python3 python3 "Python runtime"
+            add_pkg_if_missing pip3 python3-pip "Python package installer fallback"
+            if ! command -v pipx >/dev/null 2>&1; then
+                NEED_PKGS+=("pipx" "python3-venv")
+                NEED_WHY+=("isolated CLI installation" "virtual environment support for pipx")
+            fi
+            add_pkg_if_missing curl curl "download source archive"
+            add_pkg_if_missing tar tar "extract source archive"
+            add_pkg_if_missing sha256sum coreutils "verify source checksum"
             if [[ "$SKIP_FFMPEG" -eq 0 ]]; then
-                command -v ffmpeg >/dev/null 2>&1 || need+=("ffmpeg")
+                add_pkg_if_missing ffmpeg ffmpeg "audio extraction and m4a conversion"
             fi
             ;;
         dnf)
-            command -v python3 >/dev/null 2>&1 || need+=("python3")
-            command -v pip3 >/dev/null 2>&1 || need+=("python3-pip")
-            command -v pipx >/dev/null 2>&1 || need+=("pipx")
+            add_pkg_if_missing python3 python3 "Python runtime"
+            add_pkg_if_missing pip3 python3-pip "Python package installer fallback"
+            add_pkg_if_missing pipx pipx "isolated CLI installation"
+            add_pkg_if_missing curl curl "download source archive"
+            add_pkg_if_missing tar tar "extract source archive"
+            add_pkg_if_missing sha256sum coreutils "verify source checksum"
             if [[ "$SKIP_FFMPEG" -eq 0 ]]; then
-                command -v ffmpeg >/dev/null 2>&1 || need+=("ffmpeg")
+                add_pkg_if_missing ffmpeg ffmpeg "audio extraction and m4a conversion"
             fi
             ;;
         pacman)
-            command -v python3 >/dev/null 2>&1 || need+=("python")
-            command -v pip3 >/dev/null 2>&1 || need+=("python-pip")
-            command -v pipx >/dev/null 2>&1 || need+=("pipx")
+            add_pkg_if_missing python3 python "Python runtime"
+            add_pkg_if_missing pip3 python-pip "Python package installer fallback"
+            add_pkg_if_missing pipx python-pipx "isolated CLI installation"
+            add_pkg_if_missing curl curl "download source archive"
+            add_pkg_if_missing tar tar "extract source archive"
+            add_pkg_if_missing sha256sum coreutils "verify source checksum"
             if [[ "$SKIP_FFMPEG" -eq 0 ]]; then
-                command -v ffmpeg >/dev/null 2>&1 || need+=("ffmpeg")
+                add_pkg_if_missing ffmpeg ffmpeg "audio extraction and m4a conversion"
             fi
             ;;
         zypper)
-            command -v python3 >/dev/null 2>&1 || need+=("python3")
-            command -v pip3 >/dev/null 2>&1 || need+=("python3-pip")
-            command -v pipx >/dev/null 2>&1 || need+=("pipx")
+            add_pkg_if_missing python3 python3 "Python runtime"
+            add_pkg_if_missing pip3 python3-pip "Python package installer fallback"
+            add_pkg_if_missing pipx python3-pipx "isolated CLI installation"
+            add_pkg_if_missing curl curl "download source archive"
+            add_pkg_if_missing tar tar "extract source archive"
+            add_pkg_if_missing sha256sum coreutils "verify source checksum"
             if [[ "$SKIP_FFMPEG" -eq 0 ]]; then
-                command -v ffmpeg >/dev/null 2>&1 || need+=("ffmpeg")
+                add_pkg_if_missing ffmpeg ffmpeg "audio extraction and m4a conversion"
             fi
             ;;
         *)
             ;;
     esac
 
-    if (( ${#need[@]} > 0 )); then
+    if (( ${#NEED_PKGS[@]} > 0 )); then
         local selected=()
-        local pkg
-        for pkg in "${need[@]}"; do
-            if confirm_pkg_install "$pkg"; then
+        local i pkg why
+        for i in "${!NEED_PKGS[@]}"; do
+            pkg="${NEED_PKGS[$i]}"
+            why="${NEED_WHY[$i]}"
+            if confirm_pkg_install "$pkg" "$why"; then
                 selected+=("$pkg")
             else
                 log_warn "Skipped dependency: $pkg"
@@ -379,8 +477,20 @@ step_dependencies() {
     # Mandatory runtime checks after optional prompts.
     for req in "${mandatory[@]}"; do
         case "$req" in
-            python3) must_have_or_die python3 "Install it with your distro package manager and rerun." ;;
-            pip3)    must_have_or_die pip3 "Install python3-pip and rerun." ;;
+            python3)
+                if ! command -v python3 >/dev/null 2>&1; then
+                    fail_step "Required command missing: python3."
+                    print_manual_dependency_help "${NEED_PKGS[@]}"
+                    return 1
+                fi
+                ;;
+            pip3)
+                if ! command -v pip3 >/dev/null 2>&1; then
+                    fail_step "Required command missing: pip3."
+                    print_manual_dependency_help "${NEED_PKGS[@]}"
+                    return 1
+                fi
+                ;;
         esac
     done
 
@@ -405,7 +515,10 @@ step_install() {
     fi
     if command -v pipx >/dev/null 2>&1; then
         pipx install "$INSTALL_SRC_DIR" --force --quiet
+        pipx inject eatmusic "yt-dlp>=2025.1" --force --quiet >/dev/null 2>&1 || true
     else
+        python3 -m pip install --user -U "yt-dlp>=2025.1" >/dev/null 2>&1 || \
+        python3 -m pip install --user -U "yt-dlp>=2025.1" --break-system-packages
         python3 -m pip install --user -e "$INSTALL_SRC_DIR" --quiet >/dev/null 2>&1 || \
         python3 -m pip install --user -e "$INSTALL_SRC_DIR" --quiet --break-system-packages
     fi
@@ -415,6 +528,17 @@ step_path() {
     LOCAL_BIN="$HOME/.local/bin"
     RC_FILE="$HOME/.bashrc"
     [[ "${SHELL:-}" == */zsh ]] && RC_FILE="$HOME/.zshrc"
+    EAT_BIN="$LOCAL_BIN/eat"
+
+    if [[ -x "$EAT_BIN" && "$(id -u)" -ne 0 && -n "$SUDO_CMD" ]]; then
+        if ${SUDO_CMD} -n true 2>/dev/null; then
+            ${SUDO_CMD} ln -sf "$EAT_BIN" /usr/local/bin/eat
+            return
+        fi
+    elif [[ -x "$EAT_BIN" && "$(id -u)" -eq 0 ]]; then
+        ln -sf "$EAT_BIN" /usr/local/bin/eat
+        return
+    fi
 
     if [[ ":$PATH:" != *":$LOCAL_BIN:"* ]]; then
         grep -qxF "export PATH=\"\$HOME/.local/bin:\$PATH\"" "$RC_FILE" 2>/dev/null || \
@@ -507,7 +631,7 @@ log_info "Starting installer..."
 run_step "Cleaning previous installation" "step_clean"
 run_step "Preparing source package" "step_prepare_source"
 [[ -f "$SRC_DIR_HINT" ]] && INSTALL_SRC_DIR="$(cat "$SRC_DIR_HINT")"
-run_step "Installing prerequisites" "step_dependencies"
+run_interactive_step "Installing prerequisites" "step_dependencies"
 run_step "Checking Python runtime" "step_python"
 run_step "Installing eatmusic package" "step_install"
 run_step "Configuring PATH" "step_path"

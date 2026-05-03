@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eatmusic"
-version = "1.0.2"
+version = "2.0.0"
 requires-python = ">=3.10"
 dependencies = [
-    "yt-dlp>=2024.1,<2026",
+    "yt-dlp>=2025.1",
     "mutagen>=1.47",
     "requests>=2.31",
     "rapidfuzz>=3.6",
