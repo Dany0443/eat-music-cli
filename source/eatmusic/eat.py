@@ -127,36 +127,14 @@ _BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 def clean(s: str) -> str:
     return _BAD.sub("_", s).strip(". ")[:180] or "_"
 
-def out_path(music_dir: str, t: Track, album_root_artist: str | None = None) -> Path:
+def out_path(music_dir: str, t: Track, collection_name: str) -> Path:
     w  = max(len(str(t.total)), 2)
     fn = f"{str(t.track_num).zfill(w)} - {clean(t.title)}.m4a"
-    root_artist = album_root_artist or t.artist
-    p  = Path(music_dir) / clean(root_artist) / clean(t.album)
+    p  = Path(music_dir) / clean(collection_name)
     p.mkdir(parents=True, exist_ok=True)
     return p / fn
 
-def choose_album_root_artist(
-    tracks: list[Track],
-    various_threshold: int = 3,
-) -> str:
-    """
-    Choose a single root artist folder for an album.
-    - If album looks like a compilation, use "Various Artists".
-    - Otherwise use dominant artist.
-    """
-    names = [t.artist.strip() for t in tracks if t.artist and t.artist.strip()]
-    if not names:
-        return "Unknown Artist"
-    c = Counter(names)
-    dominant, dominant_n = c.most_common(1)[0]
-    distinct = len(c)
-    total = len(names)
-    dominant_share = dominant_n / total if total else 1.0
-    is_compilation = (
-        distinct >= max(various_threshold, 4)
-        or (distinct >= various_threshold and dominant_share < 0.80)
-    )
-    return "Various Artists" if is_compilation else dominant
+
 
 # ── YouTube search + matching ─────────────────────────────────────────────────
 
@@ -399,7 +377,7 @@ def _save_failed_queue(music_dir: str, items: list[dict]) -> None:
 def process(
     t: Track,
     music_dir: str,
-    album_root_artist: str | None,
+    collection_name: str,
     force: bool,
     no_lyrics: bool,
     dry_run: bool,
@@ -410,7 +388,7 @@ def process(
     """
     Returns (success, message).
     """
-    dest = out_path(music_dir, t, album_root_artist=album_root_artist)
+    dest = out_path(music_dir, t, collection_name)
 
     # Already done?
     if not force and dest.exists() and dest.stat().st_size > 10_000:
@@ -613,21 +591,15 @@ def main(
     else:
         C.print("[dim]Fetching Spotify metadata…[/dim]")
         try:
-            tracks = get_tracks(url)
+            tracks, collection_name = get_tracks(url)
         except Exception as e:
             C.print(f"[red]✗[/red] {e}")
             sys.exit(1)
         kind, _ = parse_url(url)
 
-    album_root_artist: str | None = None
-    if kind == "album":
-        album_root_artist = choose_album_root_artist(tracks, various_threshold=3)
     if kind in {"album", "playlist"} and workers > 1 and not dry_run:
         C.print("[yellow]Tip:[/yellow] multi-track URLs are more stable with [bold]--serial[/bold] or [bold]--workers 1[/bold].")
-    label   = f"{tracks[0].artist} — " + (
-        tracks[0].album if kind == "album" else
-        tracks[0].title if kind == "track" else "Playlist"
-    )
+    label   = collection_name
     C.print(Panel(
         f"[bold]{label}[/bold]  [dim]({len(tracks)} track{'s' if len(tracks)>1 else ''})[/dim]\n"
         f"[dim]→ {mdir}[/dim]" + ("  [yellow]dry-run[/yellow]" if dry_run else ""),
@@ -650,7 +622,7 @@ def main(
         def _do(args):
             i, t = args
             ok, msg = process(
-                t, mdir, album_root_artist, force, no_lyrics, dry_run,
+                t, mdir, collection_name, force, no_lyrics, dry_run,
                 yt_cookies, yt_cookies_from_browser, yt_sleep,
             )
             return i, t, ok, msg

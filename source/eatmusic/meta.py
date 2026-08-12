@@ -152,7 +152,7 @@ def _track_from_entity(e: dict, album_override: dict | None = None) -> Track:
         art_url      = _img(images),
     )
 
-def _tracks_from_embed(kind: str, sid: str) -> Optional[list[Track]]:
+def _tracks_from_embed(kind: str, sid: str) -> Optional[tuple[list[Track], str]]:
     data = _embed_json(kind, sid)
     if not data:
         return None
@@ -166,7 +166,7 @@ def _tracks_from_embed(kind: str, sid: str) -> Optional[list[Track]]:
         raise MetadataError("schema_change", "Spotify embed schema did not include an expected entity object")
 
     if kind == "track":
-        return [_track_from_entity(entity)]
+        return ([_track_from_entity(entity)], entity.get("name") or entity.get("title") or "Unknown")
 
     if kind == "album":
         album_stub = {
@@ -188,18 +188,25 @@ def _tracks_from_embed(kind: str, sid: str) -> Optional[list[Track]]:
             tr = _track_from_entity(t, album_stub)
             if tr.id:
                 tracks.append(tr)
-        return tracks or None
+        collection_name = entity.get("name") or entity.get("title") or "Unknown"
+        return (tracks, collection_name) if tracks else None
 
     if kind == "playlist":
         tracks = []
-        for item in (_nav(entity, "tracks", "items") or []):
-            t = item.get("track") or item
-            if t and t.get("id"):
+        items = _nav(entity, "tracks", "items") or entity.get("trackList") or []
+        for item in items:
+            t = item.get("track") if isinstance(item, dict) and "track" in item else item
+            if t and (t.get("id") or t.get("uri")):
                 try:
                     tracks.append(_track_from_entity(t))
                 except Exception:
                     pass
-        return tracks or None
+        collection_name = entity.get("name") or entity.get("title") or "Unknown"
+        total = len(tracks)
+        for idx, tr in enumerate(tracks, start=1):
+            tr.track_num = idx
+            tr.total = total
+        return (tracks, collection_name) if tracks else None
 
     return None
 
@@ -232,10 +239,11 @@ def _api(path: str) -> dict:
     )
     return r.json()
 
-def _tracks_from_api(kind: str, sid: str) -> Optional[list[Track]]:
+def _tracks_from_api(kind: str, sid: str) -> Optional[tuple[list[Track], str]]:
     try:
         if kind == "track":
-            return [_track_from_entity(_api(f"tracks/{sid}"))]
+            t = _track_from_entity(_api(f"tracks/{sid}"))
+            return ([t], t.title)
         if kind == "album":
             d = _api(f"albums/{sid}")
             stub = {
@@ -252,7 +260,7 @@ def _tracks_from_api(kind: str, sid: str) -> Optional[list[Track]]:
                 next_url = results.get("next")
                 results = (_get(next_url, headers={"Authorization": f"Bearer {_anon_token()}"}, timeout=12).json()
                            if next_url else None)
-            return tracks
+            return (tracks, d.get("name", "Unknown")) if tracks else None
         if kind == "playlist":
             d = _api(f"playlists/{sid}")
             tracks = []
@@ -266,7 +274,11 @@ def _tracks_from_api(kind: str, sid: str) -> Optional[list[Track]]:
                 next_url = results.get("next")
                 results = (_get(next_url, headers={"Authorization": f"Bearer {_anon_token()}"}, timeout=12).json()
                            if next_url else None)
-            return tracks or None
+            total = len(tracks)
+            for idx, tr in enumerate(tracks, start=1):
+                tr.track_num = idx
+                tr.total = total
+            return (tracks, d.get("name", "Unknown")) if tracks else None
     except requests.RequestException:
         raise
     except KeyError as e:
@@ -310,9 +322,9 @@ def _human_error(code: str) -> str:
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
-def get_tracks(url: str) -> list[Track]:
+def get_tracks(url: str) -> tuple[list[Track], str]:
     """
-    Resolve a Spotify URL to a list of Track objects.
+    Resolve a Spotify URL to a tuple of (list of Track objects, collection name).
     Tries embed scraping first, then anonymous token API.
     """
     kind, sid = parse_url(url)
@@ -321,9 +333,9 @@ def get_tracks(url: str) -> list[Track]:
     for attempt in range(3):
         for source in (_tracks_from_embed, _tracks_from_api):
             try:
-                tracks = source(kind, sid)
-                if tracks:
-                    return tracks
+                res = source(kind, sid)
+                if res:
+                    return res
             except Exception as e:
                 errors.append(_classify_error(e))
         if attempt < 2:
