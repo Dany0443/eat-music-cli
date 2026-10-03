@@ -1,3 +1,7 @@
+> **Repository Status: Archived**
+>
+> This repository has been archived and is no longer actively maintained. The codebase is preserved for reference and historical purposes. Issues and pull requests are disabled.
+
 # Eat CLI
 
 Download Spotify tracks, albums, and playlists as tagged `.m4a` files.  
